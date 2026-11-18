@@ -985,6 +985,7 @@ const baseDefaultServices: Omit<PageModelServices, "ledger" | "pageBudget"> = {
     return preparePageDownload(
       {
         cdp: baseDefaultServices.cdp,
+        subscribeBrowserEvents,
         subscribePageEvents,
       },
       targetId,
