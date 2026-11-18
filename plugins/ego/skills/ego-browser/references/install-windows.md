@@ -52,6 +52,44 @@ ego-browser skill
 
 Then return to the user's original task, as `install.md` describes.
 
+## Use the Windows ego-browser from WSL
+
+This section applies when ego lite is installed on Windows but the coding agent runs inside WSL. There is no Linux build of ego-browser, so the agent drives the Windows CLI through WSL interop. This is a local bridge, not a separate installation: the Windows browser and its signed-in state are shared.
+
+WSL interop puts Windows PATH directories on the WSL PATH, but it exposes the command as `ego-browser.exe`, so a bare `ego-browser` is still not found. Give the agent a `ego-browser` command by adding a wrapper that forwards everything to the Windows CLI:
+
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/ego-browser <<'SH'
+#!/bin/sh
+exec ego-browser.exe "$@"
+SH
+chmod +x ~/.local/bin/ego-browser
+```
+
+Make sure `~/.local/bin` is on the WSL PATH, then confirm the bridge from WSL:
+
+```bash
+command -v ego-browser
+ego-browser skill
+ego-browser nodejs <<'EOF'
+console.log('ego-browser ready')
+EOF
+```
+
+If `command -v ego-browser.exe` finds nothing, WSL interop PATH sharing is disabled. Check that `/etc/wsl.conf` enables `[interop] enabled=true`, or point the wrapper at the installed EXE directly:
+
+```bash
+exe=$(ls /mnt/c/Users/*/.local/share/ego/active_version_dir/ego-browser.exe 2>/dev/null | head -1)
+```
+
+Then replace `ego-browser.exe` in the wrapper with that absolute path.
+
+The `exec` in the wrapper keeps stdin, stdout, stderr, and the exit code intact, so heredoc scripts and `--sdk-path` invocations work unchanged. Two paths differ from a native installation:
+
+- Absolute paths that scripts hand to the browser, such as task space workspaces and `download.saveAs()` targets, are read by the Windows-side runtime. Use Windows paths (`C:/Users/<name>/...`), not WSL paths (`/home/...`), because the Windows process cannot see the WSL filesystem.
+- The `ego-browser skill` guide is the Windows guide, and its examples already use Windows path conventions.
+
 ## Troubleshooting
 
 - **SmartScreen blocks the installer**: have the user choose "More info" and then "Run anyway" in the SmartScreen dialog.

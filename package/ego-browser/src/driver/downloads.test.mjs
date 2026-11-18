@@ -26,12 +26,18 @@ const sharedDirectory = join(stateDir, "downloads");
 const waiterMarker = (pid) => join(sharedDirectory, "waiters", String(pid));
 
 function recordingServices(calls = [], listeners = new Map()) {
+  const browserListeners = new Set();
   return {
     calls,
     listeners,
+    browserListeners,
     async cdp(method, params, sessionId) {
       calls.push({ method, params, sessionId });
       return {};
+    },
+    subscribeBrowserEvents(listener) {
+      browserListeners.add(listener);
+      return () => browserListeners.delete(listener);
     },
     subscribePageEvents(targetId, listener) {
       listeners.set(targetId, listener);
@@ -44,6 +50,29 @@ function beginDownload(services, targetId, guid, suggestedFilename) {
   services.listeners.get(targetId)({
     method: "Page.downloadWillBegin",
     params: { guid, url: `https://example.test/${guid}`, suggestedFilename },
+  });
+}
+
+function beginPopupDownload(services, guid, suggestedFilename, contextId) {
+  services.browserListeners.forEach((listener) => {
+    listener({
+      method: "Browser.downloadWillBegin",
+      params: {
+        guid,
+        url: `https://example.test/${guid}`,
+        suggestedFilename,
+        ...(contextId ? { browserContextId: contextId } : {}),
+      },
+    });
+  });
+}
+
+function completePopupDownload(services, guid) {
+  services.browserListeners.forEach((listener) => {
+    listener({
+      method: "Browser.downloadProgress",
+      params: { guid, state: "completed" },
+    });
   });
 }
 
@@ -113,6 +142,99 @@ test("a page download lands in the shared directory under its guid and can be sa
   await assert.rejects(access(join(sharedDirectory, "guid-1")));
   await access(sharedDirectory);
   await rm(outputDir, { recursive: true, force: true });
+  disposeDownloadArtifacts();
+});
+
+test("a target=_blank download attributes through browser-level events", async () => {
+  const services = recordingServices();
+  const interception = preparePageDownload(services, "target-popup", {
+    timeoutMs: 1_000,
+  });
+  await interception.ready("session-popup");
+
+  beginPopupDownload(services, "guid-popup", "fixture.txt");
+  const download = await interception.event;
+  assert.equal(download.url, "https://example.test/guid-popup");
+  assert.equal(download.suggestedFilename, "fixture.txt");
+
+  await writeFile(join(sharedDirectory, "guid-popup"), "popup body");
+  completePopupDownload(services, "guid-popup");
+  assert.equal(await download.failure(), null);
+  assert.equal(await download.path(), join(sharedDirectory, "guid-popup"));
+
+  const outputDir = await mkdtemp(join(tmpdir(), "ego-download-output-"));
+  const outputPath = join(outputDir, "saved.txt");
+  await download.saveAs(outputPath);
+  await download.delete();
+  await assert.rejects(access(join(sharedDirectory, "guid-popup")));
+  await rm(outputDir, { recursive: true, force: true });
+  disposeDownloadArtifacts();
+});
+
+test("browser-level attribution ignores a download from another browser context", async () => {
+  const services = recordingServices();
+  services.cdp = async (method, params, sessionId) => {
+    services.calls.push({ method, params, sessionId });
+    if (method === "Target.getTargetInfo") {
+      return { targetInfo: { browserContextId: "context-armed" } };
+    }
+    return {};
+  };
+  const interception = preparePageDownload(services, "target-context", {
+    timeoutMs: 5_000,
+  });
+  await interception.ready("session-context");
+
+  const settled = [];
+  void interception.event.then(
+    () => settled.push("resolved"),
+    () => settled.push("rejected"),
+  );
+  beginPopupDownload(services, "guid-other-context", "other.txt", "context-x");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(
+    settled,
+    [],
+    "a download from another context must not resolve this waiter",
+  );
+
+  beginPopupDownload(services, "guid-matching", "fixture.txt", "context-armed");
+  await interception.event;
+  await writeFile(join(sharedDirectory, "guid-matching"), "body");
+  completePopupDownload(services, "guid-matching");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(settled, ["resolved"]);
+  disposeDownloadArtifacts();
+});
+
+test("two same-context waiters never adopt the same popup download", async () => {
+  const first = recordingServices();
+  const second = recordingServices();
+  const waiterA = preparePageDownload(first, "target-a", { timeoutMs: 5_000 });
+  const waiterB = preparePageDownload(second, "target-b", { timeoutMs: 5_000 });
+  await waiterA.ready("session-a");
+  await waiterB.ready("session-b");
+
+  beginPopupDownload(first, "guid-shared", "fixture.txt");
+  const adopted = await waiterA.event;
+  assert.equal(adopted.suggestedFilename, "fixture.txt");
+
+  const settledB = [];
+  void waiterB.event.then(
+    () => settledB.push("resolved"),
+    () => settledB.push("rejected"),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(
+    settledB,
+    [],
+    "the second waiter must keep waiting for its own download",
+  );
+
+  await writeFile(join(sharedDirectory, "guid-shared"), "body");
+  completePopupDownload(first, "guid-shared");
+  await waiterB.dispose();
+  await adopted.delete();
   disposeDownloadArtifacts();
 });
 

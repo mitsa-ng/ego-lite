@@ -17,6 +17,7 @@ type DownloadServices = {
     sessionId?: string,
     timeoutMs?: number,
   ): Promise<any>;
+  subscribeBrowserEvents(listener: (event: any) => void): () => void;
   subscribePageEvents(
     targetId: string,
     listener: (event: any) => void,
@@ -63,6 +64,10 @@ const ownedFiles = new Set<string>();
 const armedInterceptions = new Set<symbol>();
 const activeInterceptions = new Set<() => void>();
 const activeDownloadTargets = new Set<string>();
+// Popup downloads (target="_blank") fire no Page-level event on the armed
+// page, so waiters adopt them from Browser-level events. Guids claimed there
+// keep other same-context waiters from adopting the same download.
+const browserAttributedGuids = new Set<string>();
 
 /**
  * The directory every ego-browser process on this machine downloads into.
@@ -93,12 +98,20 @@ export function preparePageDownload(
   const configuredSessions = new Set<string>();
   let guid: string | undefined;
   let filePath: string | undefined;
+  let browserContextId: string | undefined;
+  let browserClaimedGuid: string | undefined;
   let disposed = false;
   let settled = false;
   let filePollTimer: ReturnType<typeof setTimeout> | undefined;
   let resolveEvent!: (artifact: DownloadArtifact) => void;
   let rejectEvent!: (error: Error) => void;
   let resolveCompletion!: (completion: DownloadCompletion) => void;
+  const releaseBrowserAttribution = () => {
+    if (browserClaimedGuid !== undefined) {
+      browserAttributedGuids.delete(browserClaimedGuid);
+      browserClaimedGuid = undefined;
+    }
+  };
   const event = new Promise<DownloadArtifact>((resolve, reject) => {
     resolveEvent = resolve;
     rejectEvent = reject;
@@ -154,6 +167,8 @@ export function preparePageDownload(
     clearTimeout(timer);
     if (filePollTimer) clearTimeout(filePollTimer);
     unsubscribe();
+    unsubscribeBrowserEvents();
+    releaseBrowserAttribution();
     activeInterceptions.delete(disposeSynchronously);
     await restoreBehavior();
     activeDownloadTargets.delete(targetId);
@@ -184,32 +199,38 @@ export function preparePageDownload(
       FILE_POLL_INTERVAL_MS,
     );
   };
+  // The armed page's own session is the authoritative source for its target's
+  // downloads, so no cross-waiter attribution guard applies here.
+  const adoptDownload = (params: any) => {
+    if (guid || disposed || settled) return;
+    if (
+      typeof params?.guid !== "string" ||
+      typeof params?.url !== "string" ||
+      typeof params?.suggestedFilename !== "string"
+    ) {
+      return;
+    }
+    guid = params.guid;
+    filePath = join(downloadDirectory(), params.guid);
+    ownedFiles.add(filePath);
+    clearTimeout(timer);
+    resolveEvent(
+      new PageDownloadArtifact(
+        services,
+        targetId,
+        params.guid,
+        params.url,
+        params.suggestedFilename,
+        filePath,
+        completion,
+      ),
+    );
+    scheduleFileCheck();
+  };
   const onEvent = (message: any) => {
     const params = message?.params;
     if (message?.method === "Page.downloadWillBegin" && !guid) {
-      if (
-        typeof params?.guid !== "string" ||
-        typeof params?.url !== "string" ||
-        typeof params?.suggestedFilename !== "string"
-      ) {
-        return;
-      }
-      guid = params.guid;
-      filePath = join(downloadDirectory(), params.guid);
-      ownedFiles.add(filePath);
-      clearTimeout(timer);
-      resolveEvent(
-        new PageDownloadArtifact(
-          services,
-          targetId,
-          params.guid,
-          params.url,
-          params.suggestedFilename,
-          filePath,
-          completion,
-        ),
-      );
-      scheduleFileCheck();
+      adoptDownload(params);
       return;
     }
     if (message?.method !== "Page.downloadProgress" || params?.guid !== guid) {
@@ -223,13 +244,54 @@ export function preparePageDownload(
       void finish({ failure: "canceled" });
     }
   };
+  // A `target="_blank"` attachment runs in a transient popup target that this
+  // process never attaches to, so its Page.downloadWillBegin never reaches the
+  // armed page. Chromium also reports every context download on the Browser
+  // domain, which is where the waiter picks those up.
+  const onBrowserEvent = (message: any) => {
+    const params = message?.params;
+    if (message?.method === "Browser.downloadWillBegin") {
+      if (guid || disposed || settled) return;
+      if (typeof params?.guid !== "string") return;
+      // Another waiter in this process already attributed this download.
+      if (browserAttributedGuids.has(params.guid)) return;
+      if (
+        browserContextId &&
+        typeof params.browserContextId === "string" &&
+        params.browserContextId !== browserContextId
+      ) {
+        return;
+      }
+      browserAttributedGuids.add(params.guid);
+      browserClaimedGuid = params.guid;
+      adoptDownload(params);
+      return;
+    }
+    if (
+      message?.method !== "Browser.downloadProgress" ||
+      params?.guid !== guid
+    ) {
+      return;
+    }
+    if (params.state === "completed") {
+      if (filePollTimer) clearTimeout(filePollTimer);
+      filePollTimer = undefined;
+      void checkForDownloadedFile();
+    } else if (params.state === "canceled") {
+      void finish({ failure: "canceled" });
+    }
+  };
   const unsubscribe = services.subscribePageEvents(targetId, onEvent);
+  const unsubscribeBrowserEvents =
+    services.subscribeBrowserEvents(onBrowserEvent);
   const disposeSynchronously = () => {
     if (disposed || settled) return;
     disposed = true;
     clearTimeout(timer);
     if (filePollTimer) clearTimeout(filePollTimer);
     unsubscribe();
+    unsubscribeBrowserEvents();
+    releaseBrowserAttribution();
     activeDownloadTargets.delete(targetId);
     void restoreBehavior();
     rejectEvent(new Error("download waiter was disposed"));
@@ -240,6 +302,8 @@ export function preparePageDownload(
     if (guid || disposed || settled) return;
     disposed = true;
     unsubscribe();
+    unsubscribeBrowserEvents();
+    releaseBrowserAttribution();
     activeInterceptions.delete(disposeSynchronously);
     void (async () => {
       await restoreBehavior();
@@ -268,6 +332,15 @@ export function preparePageDownload(
         { behavior: "allowAndName", downloadPath },
         sessionId,
       );
+      // Browser-level download events carry a browserContextId; remember this
+      // page's context so a download from another space stays unattributed.
+      void services
+        .cdp("Target.getTargetInfo", {}, sessionId, 1_000)
+        .then((info: any) => {
+          const found = info?.targetInfo?.browserContextId;
+          if (typeof found === "string") browserContextId = found;
+        })
+        .catch(() => {});
     },
     event,
     async dispose(reason = new Error("download waiter was disposed")) {
@@ -276,6 +349,8 @@ export function preparePageDownload(
       clearTimeout(timer);
       if (filePollTimer) clearTimeout(filePollTimer);
       unsubscribe();
+      unsubscribeBrowserEvents();
+      releaseBrowserAttribution();
       activeInterceptions.delete(disposeSynchronously);
       await restoreBehavior();
       activeDownloadTargets.delete(targetId);
@@ -477,6 +552,7 @@ export function disposeDownloadArtifacts(): void {
   for (const dispose of [...activeInterceptions]) dispose();
   activeInterceptions.clear();
   activeDownloadTargets.clear();
+  browserAttributedGuids.clear();
   if (armedInterceptions.size > 0) {
     armedInterceptions.clear();
     if (sharedDirectory) stopWaiterMarker();

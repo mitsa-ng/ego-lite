@@ -42,6 +42,7 @@ test("disposeEgoSdk releases native callbacks and rejects pending CDP work", () 
         if (params.downloadPath) downloadPath = params.downloadPath;
         return {};
       },
+      subscribeBrowserEvents() { return () => {}; },
       subscribePageEvents() { return () => {}; },
     }, "target-download", { timeoutMs: 10_000 });
     void downloadWait.event.catch(() => {});
@@ -132,6 +133,7 @@ test("the embedded SDK removes owned download files when the process exits witho
     let listener;
     const interception = downloads.preparePageDownload({
       async cdp() { return {}; },
+      subscribeBrowserEvents() { return () => {}; },
       subscribePageEvents(_targetId, next) {
         listener = next;
         return () => {};
